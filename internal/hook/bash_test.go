@@ -2161,3 +2161,97 @@ func TestTheSubstitutionBodyPeelsOnItsOwnTokensToo(t *testing.T) {
 		}
 	})
 }
+
+// A segment with no command word that sends its `<` target anyway (Q219).
+// bash does it for a substitution body that is one bare redirect, its short
+// form of `$(cat f)`, and zsh does it wherever the command word is missing, by
+// running $READNULLCMD. Each block row printed the key under its shell and
+// each quiet row printed nothing -- bash 5.3.15 and `zsh -f` 5.9, driven
+// 2026-11-01 -- except two over-reads, each marked where it sits.
+func TestABareInputRedirectIsReadWhereTheShellSendsIt(t *testing.T) {
+	dir, name := planted(t)
+	for _, tc := range []struct {
+		shell         string
+		blocks, quiet []string
+	}{
+		{"bash", []string{
+			`echo $(<` + name + `)`,
+			"echo `<" + name + "`",
+			`x=$(< ` + name + `); echo "$x"`,
+			`echo $( < ` + name + ` )`,
+			`echo $(0<` + name + `)`,
+			`echo $(<` + name + `;)`,
+			`echo $(<"` + name + `")`,
+			`F=` + name + `; echo $(<$F)`,
+			`printf %s "$(<` + name + `)"`,
+			// Neither shell prints this: Segments drops the digit.
+			`echo $(3<` + name + `)`,
+			// The controls, which denied before.
+			`echo $(cat ` + name + `)`,
+			`cat < ` + name,
+		}, []string{
+			`<` + name,
+			`< ` + name + ` | cat`,
+			`(<` + name + `)`,
+			`! <` + name,
+			`{ <` + name + `; }`,
+			`echo $(<` + name + ` <` + name + `)`,
+			`echo $(<` + name + ` >/dev/null)`,
+			`echo $(<` + name + ` | cat)`,
+			`echo $(<` + name + ` &)`,
+			`echo $(! <` + name + `)`,
+			`echo $( (<` + name + `) )`,
+			`echo $({ <` + name + `; })`,
+			`echo "$(echo; <` + name + `)"`,
+			`<` + name + ` 2>/dev/null`,
+			`echo $(<` + name + ` 2>/dev/null)`,
+			`echo $(2>/dev/null <` + name + `)`,
+			`echo $(<` + name + ` 3>/dev/null)`,
+			`echo $(< ` + name + ` >/dev/stdout)`,
+		}},
+		{"zsh", []string{
+			`echo $(<` + name + `)`,
+			`<` + name,
+			`< ` + name + ` | cat`,
+			`(<` + name + `)`,
+			`! <` + name,
+			`{ <` + name + `; }`,
+			`echo $(<` + name + ` | cat)`,
+			`echo "$(echo; <` + name + `)"`,
+			// Only an fd-1 redirect to a file keeps the output in, and
+			// Segments drops descriptors, so every one of these is read.
+			`<` + name + ` 2>/dev/null`,
+			`<` + name + ` >&2`,
+			`echo $(<` + name + ` 2>/dev/null)`,
+			`echo $(2>/dev/null <` + name + `)`,
+			`echo $(<` + name + ` 3>/dev/null)`,
+			`echo $(< ` + name + ` >/dev/stdout)`,
+			// Which makes this one an over-read: zsh prints nothing.
+			`<` + name + ` >/dev/null`,
+		}, []string{
+			`X=1 <` + name,
+		}},
+	} {
+		for _, command := range tc.blocks {
+			t.Run(tc.shell+": "+command+" blocks", func(t *testing.T) {
+				shellNamed(t, tc.shell)
+				code, stdout, stderr := drive(t, bashCall(t, command, dir))
+				if code != 0 {
+					t.Fatalf("exit code = %d, want 0 (stderr: %q)", code, stderr)
+				}
+				if reason := reasonOf(t, stdout); !strings.Contains(reason, "aws-access-key-id") {
+					t.Errorf("reason does not name the rule: %q", reason)
+				}
+			})
+		}
+		for _, command := range tc.quiet {
+			t.Run(tc.shell+": "+command+" reads nothing", func(t *testing.T) {
+				shellNamed(t, tc.shell)
+				code, stdout, stderr := drive(t, bashCall(t, command, dir))
+				if code != 0 || stdout != "" {
+					t.Errorf("exit %d, stdout %q, want a silent 0 -- the shell prints nothing here (stderr: %q)", code, stdout, stderr)
+				}
+			})
+		}
+	}
+}
