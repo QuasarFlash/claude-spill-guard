@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -101,7 +102,7 @@ func bashTargets(command, cwd string) ([]target, error) {
 		depth int
 		state substState
 	}
-	queue := []job{{command, 0, substState{cwd, false, newVars(), false}}}
+	queue := []job{{command, 0, substState{cwd, false, newVars(), false, nil, nil, ""}}}
 	// Two zsh readings, taken once over the whole command because the shapes
 	// need not sit at a segment's head, nor in the body they affect: a glob
 	// qualifier, which Segments splits off as a subshell so that `cat *(D)`
@@ -112,6 +113,7 @@ func bashTargets(command, cwd string) ([]target, error) {
 	// substituted head, which is where `o=setopt; $o globdots` resolves.
 	qualified := bash.GluedParen(command)
 	zshOptions := toolShellIsZsh() && bash.ChangesZshOptions(command)
+	lastpipe := mayLastpipe(command)
 	for len(queue) > 0 {
 		cur := queue[0]
 		queue = queue[1:]
@@ -158,9 +160,28 @@ func bashTargets(command, cwd string) ([]target, error) {
 		// move had run by the time a later segment does; vars.go has the rule.
 		list := andOr{settled: true}
 		var saved []savedShell
+		funcs := cdFunctions(segments, cur.state.funcs, lastpipe)
+		arms := definitionArms(segments, funcs)
+		reached := maps.Clone(cur.state.reached)
+		if reached == nil {
+			reached = map[string]bool{}
+		}
+		leftUnknown := false
 		for i, segment := range segments {
+			// A last stage `lastpipe` may run in this shell left the
+			// directory wherever its `cd` took it.
+			dirUnknown = dirUnknown || leftUnknown
+			leftUnknown = lastpipe && segment.LastStage
+			moved = moved || leftUnknown
 			list.enter(segment, v, &dirUnknown)
 			dir, dirUnknown = enterShell(&saved, segment.Shells, dir, dirUnknown)
+			body := segment.Body
+			if body == "" {
+				body = cur.state.within
+			}
+			if pastDefinition(reached, arms[i], body) {
+				moved, dirUnknown = true, true
+			}
 			sub := v.expand(segment.Tokens)
 			inputs := v.expand(segment.Inputs)
 			v.noteCDPATH(segment.Tokens, sub, segment.QuotedFrom)
@@ -212,6 +233,9 @@ func bashTargets(command, cwd string) ([]target, error) {
 				dir, dirUnknown = follow(kind, arg, dir, dirUnknown, segment, v.cdpath)
 				list.moved(segment, dirUnknown)
 				continue
+			}
+			if !segment.Forked && callsCdFunction(wrap, funcs) {
+				moved, dirUnknown = true, true
 			}
 			list.ran()
 			tokens = wrap.Argv
@@ -457,8 +481,8 @@ func bashTargets(command, cwd string) ([]target, error) {
 		// map would otherwise be the one reading that forgot an assignment.
 		unplaced := newVars()
 		unplaced.cdpath = v.cdpath
-		states := substStates(stripped, subs, cur.state,
-			substState{cur.state.dir, cur.state.unknown || moved, unplaced, globsAltered})
+		states := substStates(stripped, subs, cur.state, lastpipe,
+			substState{cur.state.dir, cur.state.unknown || moved, unplaced, globsAltered, funcs, maps.Clone(reached), ""})
 		for i, body := range bash.UnstrippedSubstBodies(cur.text, bodies) {
 			queue = append(queue, job{body, cur.depth + 1, states[i]})
 		}
@@ -471,7 +495,7 @@ func bashTargets(command, cwd string) ([]target, error) {
 		for _, doc := range append(docs.Expanded, docs.Unterminated...) {
 			for _, body := range bash.CommandSubstitutions(doc, false) {
 				queue = append(queue, job{body, cur.depth + 1,
-					substState{cur.state.dir, cur.state.unknown || moved, unplaced, globsAltered}})
+					substState{cur.state.dir, cur.state.unknown || moved, unplaced, globsAltered, funcs, maps.Clone(reached), ""}})
 			}
 		}
 	}
@@ -498,6 +522,11 @@ type substState struct {
 	unknown      bool
 	vars         *vars
 	globsAltered bool
+	funcs        map[string]bool
+	// reached is the definitions of funcs passed where the body was written,
+	// and within the function it was written in, for pastDefinition.
+	reached map[string]bool
+	within  string
 }
 
 // substStates says, for each substitution in subs, what was in force where it
@@ -525,7 +554,7 @@ type substState struct {
 // marking, so none of them is a new refusal: a string already carrying the
 // sentinel, a span set that does not run forward, and a marked string the
 // segmenter cannot read.
-func substStates(text string, subs []bash.Substitution, entry, fallback substState) []substState {
+func substStates(text string, subs []bash.Substitution, entry substState, lastpipe bool, fallback substState) []substState {
 	out := make([]substState, len(subs))
 	for i := range out {
 		out[i] = fallback
@@ -549,7 +578,16 @@ func substStates(text string, subs []bash.Substitution, entry, fallback substSta
 	v := entry.vars.clone()
 	list := andOr{settled: true}
 	var saved []savedShell
-	for _, segment := range segments {
+	funcs := cdFunctions(segments, entry.funcs, lastpipe)
+	arms := definitionArms(segments, funcs)
+	reached := maps.Clone(entry.reached)
+	if reached == nil {
+		reached = map[string]bool{}
+	}
+	leftUnknown := false
+	for i, segment := range segments {
+		unknown = unknown || leftUnknown
+		leftUnknown = lastpipe && segment.LastStage
 		// A restored copy, and everything below reads it rather than the marked
 		// segment: every rule here is written for shell text, and a marker is a
 		// bare word carrying neither a `$` nor a backtick, so one reaching a
@@ -573,6 +611,13 @@ func substStates(text string, subs []bash.Substitution, entry, fallback substSta
 		seg.Redirects = restoreAll(segment.Redirects, text, subs)
 		list.enter(seg, v, &unknown)
 		dir, unknown = enterShell(&saved, seg.Shells, dir, unknown)
+		// Kept for the bodies written here, which lose their own directory
+		// in their own walk; a marker's directory is never read past one.
+		body := seg.Body
+		if body == "" {
+			body = entry.within
+		}
+		pastDefinition(reached, arms[i], body)
 		// Read the positions before this segment's own `cd`, assignments and
 		// glob change apply, off the MARKED tokens, which are the only ones a
 		// marker survives in. A substitution is expanded to build the command
@@ -583,7 +628,7 @@ func substStates(text string, subs []bash.Substitution, entry, fallback substSta
 		//
 		// One clone per segment, shared by every marker in it and never
 		// mutated afterwards: the pass that consumes it clones again.
-		here := substState{dir, unknown, v.clone(), globsAltered}
+		here := substState{dir, unknown, v.clone(), globsAltered, funcs, maps.Clone(reached), body}
 		for _, tok := range segment.Tokens {
 			recordMarks(out, tok, here)
 		}
@@ -615,9 +660,131 @@ func substStates(text string, subs []bash.Substitution, entry, fallback substSta
 			list.moved(seg, unknown)
 			continue
 		}
+		if !seg.Forked && callsCdFunction(wrap, funcs) {
+			unknown = true
+		}
 		list.ran()
 	}
 	return out
+}
+
+// cdFunctions is upstream's cd_functions (its Q265): the names of the
+// functions a call to which moves the caller's directory. A body runs in the
+// shell that calls it, so a `cd` written at the body's own level moves the
+// caller at every call and moves nothing at the definition. A body calling one
+// of these moves its caller too, and so does a last stage `lastpipe` may run
+// in the body's shell. known names the ones an enclosing string defined, which
+// a substitution inherits.
+func cdFunctions(segments []bash.Segment, known map[string]bool, lastpipe bool) map[string]bool {
+	funcs := maps.Clone(known)
+	if funcs == nil {
+		funcs = map[string]bool{}
+	}
+	// A function named for the cd family runs in place of the builtin, so
+	// `cd() { :; }; cd w` moves nowhere and `cd w` is a call like any other.
+	for _, seg := range segments {
+		if seg.Body == "cd" || seg.Body == "pushd" || seg.Body == "popd" {
+			funcs[seg.Body] = true
+		}
+	}
+	for grew := true; grew; {
+		grew = false
+		for _, seg := range segments {
+			name := seg.Function
+			if name == "" || funcs[name] || seg.Forked && !(lastpipe && seg.LastStage) {
+				continue
+			}
+			if !(lastpipe && seg.LastStage) {
+				k := bash.ShKeywordPeel(seg.Tokens, seg.QuotedFrom)
+				wrap := readers.PeelWrappers(seg.Tokens[k+bash.EnvPrefixPeel(seg.Tokens[k:], seg.QuotedFrom[k:]):])
+				if wrap.External || len(wrap.Argv) == 0 {
+					continue
+				}
+				if kind, _ := classifyCd(wrap.Argv); kind == "" && !funcs[wrap.Argv[0]] {
+					continue
+				}
+			}
+			funcs[name], grew = true, true
+		}
+	}
+	return funcs
+}
+
+// callsCdFunction is upstream's calls_cd_function: whether a peeled segment
+// runs a function from cdFunctions. The call leaves the directory unknown
+// rather than followed, as upstream does. It is no longer the only reading: a
+// call need not name the function, which pastDefinition answers instead.
+func callsCdFunction(wrap readers.Peel, funcs map[string]bool) bool {
+	return !wrap.External && len(wrap.Argv) > 0 && funcs[wrap.Argv[0]]
+}
+
+// pastDefinition adds the definitions arms says are reached at this segment,
+// and reports whether one other than body's own had been reached. Past such a
+// definition no segment's move is followed, because a call need not name the
+// function: review of Q212 found `eval f`, `${g:-f}`, `${ f; }` in an
+// argument, `compgen -F f`, `trap f DEBUG` and `mapfile -C f`, each run on
+// bash 5.3.15, in two rounds. Bash cannot run a function before its
+// definition is reached, so position is the one reading no new path gets
+// past. Measured 2026-11-01 over 235,553 real Bash calls: 10 define a moving
+// function and 1 has a relative operand after it.
+func pastDefinition(reached map[string]bool, arms []string, body string) bool {
+	for _, name := range arms {
+		reached[name] = true
+	}
+	for name := range reached {
+		if name != body {
+			return true
+		}
+	}
+	return false
+}
+
+// definitionArms is where each definition of funcs counts as reached, by
+// segment index: at the definition, or inside a for, while, until or select
+// body at the first segment of the outermost loop around it, since a later
+// pass runs what sits before it in the text. `for i in 1 2; do eval f; cat x;
+// f() { cd w; }; done` reads w/x on its second pass (review of Q212, driven
+// on bash 5.3.15, with `while`, `until` and `select` alike).
+func definitionArms(segments []bash.Segment, funcs map[string]bool) map[int][]string {
+	arms := map[int][]string{}
+	var loops []int
+	for i, seg := range segments {
+		k := bash.ShKeywordPeel(seg.Tokens, seg.QuotedFrom)
+		for _, t := range seg.Tokens[:k] {
+			switch t {
+			case "while", "until":
+				loops = append(loops, i)
+			case "done":
+				if len(loops) > 0 {
+					loops = loops[:len(loops)-1]
+				}
+			}
+		}
+		if k < len(seg.Tokens) && seg.QuotedFrom[k] == bash.NotQuoted &&
+			(seg.Tokens[k] == "for" || seg.Tokens[k] == "select") {
+			loops = append(loops, i)
+		}
+		if funcs[seg.Body] {
+			at := i
+			if len(loops) > 0 {
+				at = loops[0]
+			}
+			arms[at] = append(arms[at], seg.Body)
+		}
+	}
+	return arms
+}
+
+// mayLastpipe reports whether `shopt -s lastpipe` may be on for this command:
+// set anywhere in the string, or in BASHOPTS. The hook's BASHOPTS is not the
+// tool shell's options, so reading it can only add a deferral; what bounds the
+// tool shell is its snapshot, and the Q212 review counted 196 of 197 on this
+// machine running `shopt -u lastpipe`, none setting it. Upstream reads the
+// `shopt` positionally and from the string alone; a substring is the superset
+// of both, and costs a verdict only on a command that names the option.
+func mayLastpipe(command string) bool {
+	return strings.Contains(command, "lastpipe") ||
+		strings.Contains(os.Getenv("BASHOPTS"), "lastpipe")
 }
 
 // markSubstitutions replaces each substitution in text with its marker, in

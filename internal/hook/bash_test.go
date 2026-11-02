@@ -968,6 +968,229 @@ func TestAMoveInASubshellReachesTheCommandsInsideIt(t *testing.T) {
 	}
 }
 
+// A compound piped or backgrounded as a whole runs in a subshell, and a
+// function body runs only when called (Q212), which are upstream's Q272 and
+// Q265. Before it both were read as the current shell, so a `cd` in either
+// moved the operands after it and `{ cd w; cat x; } | cat; cat x` scanned
+// `w/x` twice where bash reads `x` the second time.
+//
+// Each row is driven on bash 5.3.15 the way the subshell test above is, the
+// key in the file bash reads and clean text everywhere else. The block rows
+// are the scopes; the deferred rows are where bash's move cannot be followed --
+// a call to a function whose body moves, and a last stage `lastpipe` runs in
+// this shell -- and each plants the key where bash reads it, so a row resolved
+// against the wrong directory allows silently instead of deferring.
+func TestACompoundInAPipelineOrAFunctionBodyKeepsItsMove(t *testing.T) {
+	tree := func(t *testing.T, key string) string {
+		root := t.TempDir()
+		for _, f := range []string{"x", "w/x"} {
+			path := filepath.Join(root, filepath.FromSlash(f))
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			body := "nothing here\n"
+			if f == key {
+				body = "AWS_ACCESS_KEY_ID=" + secret + "\n"
+			}
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return root
+	}
+	for _, tc := range []struct{ command, key string }{
+		{"{ cd w; cat x; } | cat; cat x", "x"},
+		{"{ cd w; cat x; } | cat; cat x", "w/x"},
+		{"cat x | { cd w; cat x; }; cat x", "w/x"},
+		{"cat /dev/null | { true; cd w; }; cat x", "x"},
+		{"{ cd w; } & wait; cat x", "x"},
+		{"{ { cd w; }; } | cat; cat x", "x"},
+		{"if true; then cd w; fi | cat; cat x", "x"},
+		{"for i in 1; do cd w; done & wait; cat x", "x"},
+		{"case a in a) cd w;; esac | cat; cat x", "x"},
+		{"f() { cd w; cat x; }; f", "w/x"},
+		{"if true; then f() { cd w; cat x; }; fi; f", "w/x"},
+		// A substitution written in the body is read with it, and the
+		// body's own definition does not arm what the body runs.
+		{`f() { cd w; echo "$(cat x)"; }; f`, "w/x"},
+		// A body in a subshell moves nothing its caller runs, so the call
+		// keeps the directory.
+		{"f() ( cd w ); f; cat x", "x"},
+		// Unpiped, a compound is the current shell, and its move stands.
+		{"while false; do :; done; { cd w; }; cat x", "w/x"},
+	} {
+		t.Run(tc.command+" reads "+tc.key, func(t *testing.T) {
+			root := tree(t, tc.key)
+			code, stdout, stderr := drive(t, bashCall(t, tc.command, root))
+			if code != 0 {
+				t.Fatalf("exit code = %d, want 0 (stderr: %q)", code, stderr)
+			}
+			if stdout == "" {
+				t.Fatalf("allowed with no verdict, want a block naming %s (stderr: %q)", tc.key, stderr)
+			}
+			if reason := reasonOf(t, stdout); !strings.Contains(reason, filepath.Join(root, filepath.FromSlash(tc.key))) {
+				t.Errorf("reason = %q, want the file at %s", reason, tc.key)
+			}
+		})
+	}
+	for _, command := range []string{
+		// Past a moving definition nothing is followed, called or not:
+		// TestAMoveThroughAWordTheHookCannotNameIsNotFollowed says why.
+		"f() { cd w; }; cat x",
+		"function f { cd w; }; cat x",
+		"f() { cd w; }; (f; cat x); cat x",
+		"f() { cd w; }; f; cat x",
+		"function f { cd w; }; f; cat x",
+		"f() { cd w; }; g() { f; }; g; cat x",
+		// A backtick body is not flattened into the parent's segments, so
+		// only the set it inherits knows f moves.
+		"f() { cd w; }; echo `f; cat x`",
+		"shopt -s lastpipe; true | { cd w; }; cat x",
+		"shopt -s lastpipe; f() { true | { cd w; }; }; f; cat x",
+	} {
+		t.Run(command+" defers", func(t *testing.T) {
+			root := tree(t, "w/x")
+			code, stdout, stderr := drive(t, bashCall(t, command, root))
+			if reason := deferred(t, code, stdout, stderr); !strings.Contains(reason, "cannot follow") {
+				t.Errorf("coverage reason = %q, want the move unfollowed", reason)
+			}
+		})
+	}
+}
+
+// A moving function can be run by a word that does not name it -- `eval f`,
+// `${g:-f}`, `${ f; }` in an argument, a sourced file, a DEBUG trap,
+// `mapfile -C`, `compgen -F` -- and a function can take the name `cd` itself,
+// after which `cd w` runs the body and not the builtin. Review of Q212 found
+// these in two rounds, so no path is enumerated: past a moving definition
+// every operand after it defers, which is pastDefinition's rule.
+//
+// Each row is driven on bash 5.3.15 as the test above is, with the key in the
+// file bash reads, so a row resolved against the directory the tracker would
+// have kept allows silently instead of deferring. ROOT is the tree. The
+// controls are the same words with no moving function defined, which still
+// block where bash reads.
+func TestAMoveThroughAWordTheHookCannotNameIsNotFollowed(t *testing.T) {
+	tree := func(t *testing.T, key string) string {
+		// Not t.TempDir, whose path carries the subtest's name -- `(`, `{`
+		// and all -- so `cd ROOT` would not be a literal the tracker follows.
+		root, err := os.MkdirTemp("", "spill-guard-q212-")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.RemoveAll(root) })
+		for _, f := range []string{"x", "w/x", "v/x", "s.sh", "l.txt"} {
+			path := filepath.Join(root, filepath.FromSlash(f))
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			body := "nothing here\n"
+			switch {
+			case f == key:
+				body = "AWS_ACCESS_KEY_ID=" + secret + "\n"
+			case f == "s.sh":
+				body = "f\n"
+			}
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return root
+	}
+	for _, tc := range []struct{ command, key string }{
+		{"f() { cd w; }; eval f; cat x", "w/x"},
+		{"f() { cd w; }; eval 'f'; cat x", "w/x"},
+		{"f() { cd w; }; builtin eval f; cat x", "w/x"},
+		{"f() { cd w; }; command eval f; cat x", "w/x"},
+		{"f() { cd w; }; ${g:-f}; cat x", "w/x"},
+		{"f() { cd w; }; `echo f`; cat x", "w/x"},
+		{`f() { cd w; }; "$(echo f)"; cat x`, "w/x"},
+		{"f() { cd w; }; . ./s.sh; cat x", "w/x"},
+		{"f() { cd w; }; source ./s.sh; cat x", "w/x"},
+		{"f() { cd w; }; trap f DEBUG; cat x", "w/x"},
+		{"f() { cd w; }; mapfile -C f -c 1 a < l.txt; cat x", "w/x"},
+		{"f() { cd w; }; g() { eval f; }; g; cat x", "w/x"},
+		{"cd() { :; }; cd w; cat x", "x"},
+		{"function cd { :; }; cd w; cat x", "x"},
+		{"cd() { builtin cd v; }; cd w; cat x", "v/x"},
+		{"pushd() { :; }; pushd w >/dev/null; cat x", "x"},
+		{`cd() { :; }; echo "$(cd w; cat x)"`, "x"},
+		{`cd() { :; }; cd w; echo "$(cat x)"`, "x"},
+		{"f() { cd w; }; echo ${ f; }; cat x", "w/x"},
+		{"f() { cd w; }; echo ${| f; }; cat x", "w/x"},
+		{"f() { cd w; }; compgen -F f x >/dev/null 2>&1; cat x", "w/x"},
+		{"cd () ( : ); cd w; cat x", "x"},
+		{"function cd ( : ); cd w; cat x", "x"},
+		{"pushd () ( : ); pushd w >/dev/null; cat x", "x"},
+		// No path is asked about, so these defer too, where bash reads
+		// the file the tracker would have reached: the cost of the rule.
+		// A substitution is placed past the definition, and a body that
+		// follows a move of its own still inherits the rule.
+		{`f() { cd w; }; eval f; echo "$(cat x)"`, "w/x"},
+		{`f() { cd w; }; echo "$(cd ROOT; eval f; cat x)"`, "w/x"},
+		// A later pass of a loop runs what sits before the definition in
+		// the text, so the outermost loop around it is where it counts from.
+		{"for i in 1 2; do eval f 2>/dev/null; cat x; f() { cd w; }; done", "w/x"},
+		{"i=0; while [ $i -lt 2 ]; do eval f 2>/dev/null; cat x; f() { cd w; }; i=$((i+1)); done", "w/x"},
+		{"i=0; until [ $i -ge 2 ]; do eval f 2>/dev/null; cat x; f() { cd w; }; i=$((i+1)); done", "w/x"},
+		{`select i in a; do eval f 2>/dev/null; cat x; f() { cd w; }; [ -n "$d" ] && break; d=1; done <<< $'1\n1'`, "w/x"},
+		{"for i in 1 2; do eval f 2>/dev/null; cat x; for j in 1; do f() { cd w; }; done; done", "w/x"},
+		{"for i in 1 2; do f() { cd w; }; done; cat x", "x"},
+		{"if true; then f() { cd w; }; fi; cat x", "x"},
+		{"if false; then :; else f() { cd w; }; fi; cat x", "x"},
+		{"{ f() { cd w; }; }; cat x", "x"},
+		{"! f() { cd w; }; cat x", "x"},
+		{"time f() { cd w; }; cat x", "x"},
+		{"! f() { cd w; }; eval f; cat x", "w/x"},
+		{"! ! f() { cd w; }; eval f; cat x", "w/x"},
+		{"if f() { cd w; }; then :; fi; cat x", "x"},
+		{"if ! f() { cd w; }; then :; fi; cat x", "x"},
+		{"if false; then :; elif f() { cd w; }; then :; fi; cat x", "x"},
+		{"while f() { cd w; }; do break; done; cat x", "x"},
+		{"while ! f() { cd w; }; do :; done; cat x", "x"},
+		{"until f() { cd w; }; do :; done; cat x", "x"},
+		{"f() { cd w; }; cd ROOT; cat x", "x"},
+		{"cd() { :; }; builtin cd w; cat x", "w/x"},
+		{"f() { cd w; }; builtin f; cat x", "x"},
+	} {
+		t.Run(tc.command+" defers", func(t *testing.T) {
+			root := tree(t, tc.key)
+			command := strings.ReplaceAll(tc.command, "ROOT", root)
+			code, stdout, stderr := drive(t, bashCall(t, command, root))
+			if reason := deferred(t, code, stdout, stderr); !strings.Contains(reason, "cannot follow") {
+				t.Errorf("coverage reason = %q, want the move unfollowed", reason)
+			}
+		})
+	}
+	for _, tc := range []struct{ command, key string }{
+		// The cd goes first: one after an eval or a source is lost anyway,
+		// since either may have assigned CDPATH.
+		{"cd w; eval true; cat x", "w/x"},
+		{"cd w; ${g:-true}; cat x", "w/x"},
+		{"cd w; . ./s.sh 2>/dev/null; cat x", "w/x"},
+		{"f() { :; }; cd w; eval f; cat x", "w/x"},
+		// A loop that ends before the definition is not reached by it.
+		{"for i in 1; do cat x; done; f() { cd w; }", "x"},
+		// A definition that does not move arms nothing.
+		{"f() { :; }; cd w; f; cat x", "w/x"},
+		{"f() ( cd v ); cd w; f; cat x", "w/x"},
+	} {
+		t.Run(tc.command+" blocks", func(t *testing.T) {
+			root := tree(t, tc.key)
+			code, stdout, stderr := drive(t, bashCall(t, tc.command, root))
+			if code != 0 {
+				t.Fatalf("exit code = %d, want 0 (stderr: %q)", code, stderr)
+			}
+			if stdout == "" {
+				t.Fatalf("allowed with no verdict, want a block naming %s (stderr: %q)", tc.key, stderr)
+			}
+			if reason := reasonOf(t, stdout); !strings.Contains(reason, filepath.Join(root, filepath.FromSlash(tc.key))) {
+				t.Errorf("reason = %q, want the file at %s", reason, tc.key)
+			}
+		})
+	}
+}
+
 // The moves whose destination is not the literal, or not a literal at all.
 // Each leaves the directory unknown and the relative operand after it
 // recorded rather than resolved -- which is also what every one of them did
