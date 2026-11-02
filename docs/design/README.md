@@ -2453,9 +2453,55 @@ against the 2026-09-05 measurement that made coverage failures defer.
 after the grep in its own pipeline is the careful form; one in a different
 pipeline of the same string filters nothing of this one's. The recursion flags
 are parsed in `internal/hook/grep.go` — `-r`, `-R`, `--recursive`,
-`--dereference-recursive`, `-d recurse` — and both GNU grep and the BSD grep
-macOS ships permute, so a flag after an operand counts: driven, `grep hello d -r
--l` on BSD grep 2.6.0 lists the file.
+`--dereference-recursive`, `-d recurse`, and a digit option such as `-2` —
+and a flag after an operand counts, because the greps permute: driven,
+`grep hello d -r -l` on BSD grep 2.6.0 and on ugrep 7.8.4 lists the file.
+
+**A quiet flag after an operand is honoured, and that is a measured trade.**
+GNU grep with `POSIXLY_CORRECT` set stops reading options at the first operand,
+so its `grep -rn pat dir -l` takes `-l` for a file and prints matched lines,
+and the hook cannot read the command's environment. Refusing a quiet flag in
+that position was built and replayed on 2026-11-01 over this machine's
+transcripts: 240,204 `Bash` calls, of which 42,448 distinct commands mention
+`grep` beside a flag it reads and still have their working directory. 86
+changed verdict, every one from allowed to refused, all of them this rule —
+shapes such as `grep -rn pat . --include='*.go' -l`, which ugrep and BSD grep
+answer with file names only. Of the 240,859 `Bash` calls on record when the
+next count was taken, 11 name `POSIXLY_CORRECT`, and all 11 are this repo's
+own probes of and notes on this case. So the flag is honoured, and the case it
+misses is GNU-only and needs an environment no session here has set.
+
+**Three greps are read at once, because `grep` in Claude Code's Bash tool is
+not always grep.** Driven 2026-11-01 on Claude Code 2.1.290, the shell snapshot
+each `Bash` call sources defines `grep` as a function that runs ugrep 7.8.4
+out of the Claude Code binary itself. The function's text is a string in that
+binary, and no shell startup file on the machine defines it. Which installs
+turn it on is not measured here. ugrep reads two shapes differently from GNU
+and BSD grep, and both are read its way:
+
+| Command, no file operand | GNU and BSD grep | ugrep 7.8.4 | Read as |
+|---|---|---|---|
+| `grep -2 pat` | `-2` is a context width; reads stdin | `-2` is a depth and turns on recursion; walks `.` | recursive |
+| `grep --context -r pat` | BSD 2.6.0 takes `--context`'s value only after `=`, so walks `.` | `-r` is the value; exits 2 | both ways, so recursive |
+
+The first costs a turn on a machine whose `grep` is GNU or BSD:
+`cmd | grep -2 pat` is refused there and offered the filtered rewrite, though
+it reads only the pipe. In the replay described above, neither this reading
+nor the `--context` one changed the verdict on any recorded command. Where the
+function is in place, the same command reads
+the pipe *and* walks the working directory, which is the crossing this refusal
+exists for, written by a session that asked for two lines of context. An unknown
+long option stays refused for the same reason: `grep --depth=3 pat` walks `.`
+on ugrep, and the table of options this reads holds GNU's and BSD's.
+
+**Which tokens are files is read by the same rules.** `internal/readers` keeps
+its own table of the options that take a value, and its grep row disagreed
+with this one in twelve places: ten options it did not consume and two it did. So `grep --color id key.env` read `id` as the
+value and `key.env` as the pattern, and the hook allowed a call that printed
+the key on both greps, driven 2026-11-01. `grepFiles` in
+`internal/hook/grep.go` now spells a long-option prefix out and reads
+`--context` both ways before asking that table, and a test holds the two tables
+in step option by option.
 
 **The rewrite is checked before it is offered.** Appending a stage pipes the
 string's last pipeline, so `echo $(grep -r x .)` produced a rewrite this hook

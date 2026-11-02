@@ -53,10 +53,7 @@ const grepShortValued = "ABCDdefm"
 
 // grepLong is every long option GNU grep 3.x or the BSD grep macOS ships
 // accepts, and whether it takes its value from the next token when no `=`
-// carries it. `--color` and `--colour` take one only with `=`. Where the two
-// greps disagree the consuming answer is kept: a consumed token is never read
-// as a flag, so it can hide `-l` and leave a call refused that would have
-// passed, and never the reverse.
+// carries it. `--color` and `--colour` take one only with `=`.
 var grepLong = map[string]bool{
 	"--after-context": true, "--basic-regexp": false, "--before-context": true,
 	"--binary": false, "--binary-files": true, "--byte-offset": false,
@@ -78,6 +75,14 @@ var grepLong = map[string]bool{
 	"--text": false, "--unix-byte-offsets": false, "--version": false,
 	"--with-filename": false, "--word-regexp": false, "--xz": false,
 }
+
+// grepLongDisputed are the long options whose greps disagree on whether a
+// value comes from the next token, so the token after one is read both ways
+// and the call takes the less quiet, more recursive answer. Driven 2026-11-01,
+// `grep --context -r x` walks `.` on BSD grep 2.6.0, which takes the value
+// only after `=`, while ugrep 7.8.4 takes `-r` as the value and fails; every
+// other option grepLong marks consuming consumed `-r` on BSD too.
+var grepLongDisputed = map[string]bool{"--context": true}
 
 // resolveLong names the long option a key stands for, or "" where this cannot
 // say. getopt_long takes any unique prefix, so `--exclude-d` is `--exclude-dir`
@@ -108,9 +113,15 @@ var grepQuietLong = map[string]bool{
 }
 
 // grepMode reads a grep's flags for whether it recurses and whether it prints
-// matched text. Both GNU grep and the BSD grep macOS ships permute, so a flag
-// after an operand counts: driven 2026-10-01, `grep hello d -r -l` on BSD grep
-// 2.6.0 lists the file rather than reading `-l` as one.
+// matched text. Three greps are read at once: GNU, the BSD grep macOS ships,
+// and ugrep, which is what `grep` runs in Claude Code's Bash tool on a machine
+// whose shell snapshot carries its grep function.
+//
+// A flag counts wherever it sits, because all three permute: driven
+// 2026-10-01, `grep hello d -r -l` on BSD grep 2.6.0 lists the file, and
+// 2026-11-01 ugrep 7.8.4 did the same. GNU grep with POSIXLY_CORRECT set stops
+// at the first operand and would take that `-l` for a file; honouring it
+// anyway is a measured choice, argued in docs/design/README.md.
 func grepMode(tokens []string) (recursive, quiet bool) {
 	unsure := false
 	defer func() {
@@ -129,7 +140,9 @@ func grepMode(tokens []string) (recursive, quiet bool) {
 			if name == "" {
 				// Unknown or ambiguous: whether it consumed the next token is
 				// not knowable, so nothing after it can be trusted to say the
-				// call prints no text. Refused rather than allowed.
+				// call prints no text. Refused rather than allowed, and read as
+				// recursive too, because an option this table lacks can be one
+				// that walks: ugrep's `--depth=3` does.
 				unsure = true
 				continue
 			}
@@ -143,6 +156,11 @@ func grepMode(tokens []string) (recursive, quiet bool) {
 					value = tokens[i+1]
 				}
 				recursive = recursive || recurses(value)
+			}
+			if grepLongDisputed[name] && !inline && i+1 < len(tokens) {
+				r1, q1 := grepMode(append(tokens[:i:i], tokens[i+2:]...))
+				r2, q2 := grepMode(append(tokens[:i:i], tokens[i+1:]...))
+				return r1 || r2, q1 && q2
 			}
 			if grepLong[name] && !inline {
 				i++
@@ -159,6 +177,11 @@ func grepMode(tokens []string) (recursive, quiet bool) {
 				recursive = true
 			case 'q', 'l', 'L', 'c':
 				quiet = true
+			case '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
+				// A context width in GNU and BSD grep, and a depth in ugrep,
+				// which turns recursion on: driven 2026-11-01, `grep -2 x`
+				// with no operand walked `.` on ugrep 7.8.4.
+				recursive = true
 			}
 			if strings.IndexByte(grepShortValued, c) >= 0 {
 				value := tok[j+1:]
@@ -181,6 +204,58 @@ func grepMode(tokens []string) (recursive, quiet bool) {
 // recursion, which refuses toward the filter rather than allowing.
 func recurses(value string) bool {
 	return value != "read" && value != "skip"
+}
+
+// grepFiles is readers.Files for a grep, read the way grepMode reads it: a
+// long option abbreviated to a unique prefix is spelled out first, because the
+// table matches names exactly and `--exclude-d node_modules x` otherwise read
+// node_modules as the pattern and x as the file, and a disputed option's next
+// token is read both ways. The files are the union of the readings, and none
+// is true when either reading has none, which is the case a recursive grep
+// searches `.` in. Driven 2026-11-01: `grep --context id key.env` prints the
+// key on BSD grep 2.6.0, and `grep -r --context 3 x` walks `.` on ugrep 7.8.4.
+func grepFiles(tokens []string) (files []string, none bool) {
+	spelled := make([]string, len(tokens))
+	copy(spelled, tokens)
+	disputed := -1
+	for i := 1; i < len(spelled); i++ {
+		tok := spelled[i]
+		if tok == "--" {
+			break
+		}
+		if !strings.HasPrefix(tok, "--") {
+			continue
+		}
+		key, value, inline := strings.Cut(tok, "=")
+		name := resolveLong(key)
+		switch {
+		case name == "":
+		case inline:
+			spelled[i] = name + "=" + value
+		default:
+			spelled[i] = name
+			if grepLongDisputed[name] && disputed < 0 && i+1 < len(spelled) {
+				disputed = i
+			}
+		}
+	}
+	readings := [][]string{spelled}
+	if disputed >= 0 {
+		consumed := append(spelled[:disputed+1:disputed+1], spelled[disputed+2:]...)
+		readings = append(readings, consumed)
+	}
+	seen := map[string]bool{}
+	for _, r := range readings {
+		got, _ := readers.Files(r)
+		none = none || len(got) == 0
+		for _, f := range got {
+			if !seen[f] {
+				seen[f] = true
+				files = append(files, f)
+			}
+		}
+	}
+	return files, none
 }
 
 // filteredLater reports whether a stage after segment i in its own pipeline is
