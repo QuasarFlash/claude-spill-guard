@@ -220,10 +220,14 @@ fire says nothing, and this one fires on every planted case while declining
 cut -d= -f1` segments into a bare `env` and a `cut`, so nothing in the `env`
 segment's own tokens tells it apart from a dump. What does is whether anything
 consumes its output: a stage after it is being written to, and nothing after it
-means the tool result is. That is what `Segment.Pipe` is read for. Redirects are
-not consulted, because `Segment.Redirects` records the target and not the
-descriptor — reading any redirect as a filter would wave through `env
-2>/dev/null`, and `env > vars.txt` is refused instead.
+means the tool result is. That is what `Segment.Pipe` is read for, with
+`Segment.StdoutAway` beside it: a later stage is a filter only where the dump's
+stdout reaches it. `env >&2 | cut -d= -f1` is refused, because the dump goes to
+stderr and the tool returns that, and `env 2>&1 | cut -d= -f1` is not. A
+redirect to a file is not read as a filter, so `env > vars.txt` is refused too.
+Re-taken with that reading on 2026-11-01, over 241,535 real `Bash` calls from
+2026-07-26 to 2026-11-02, no verdict moved; 16 driven control rows moved 5, and
+19 commands the segmenter could not split were left out.
 
 **Only the bare form of each command**: `env`, `printenv`, `set`, `export`,
 `export -p`, `declare -p`, `typeset -p`, and an inline `python`/`node` script
@@ -2451,7 +2455,12 @@ against the 2026-09-05 measurement that made coverage failures defer.
 
 **Position in the pipeline is the test, as it is for `env`.** A filter stage
 after the grep in its own pipeline is the careful form; one in a different
-pipeline of the same string filters nothing of this one's. The recursion flags
+pipeline of the same string filters nothing of this one's. It counts only
+where grep's stdout still reaches it. `grep -rn pat dir >&2 | spill-guard
+filter` sends the matches to stderr, which the tool result carries, so
+`Segment.StdoutAway` reads the redirects in order and the filter is not
+counted. A `{ …; }`, loop or subshell piped as a whole is one stage, so a grep
+inside one is filtered by the stage it feeds. Driven on bash 5.3.15 (Q208). The recursion flags
 are parsed in `internal/hook/grep.go` — `-r`, `-R`, `--recursive`,
 `--dereference-recursive`, `-d recurse`, and a digit option such as `-2` —
 and a flag after an operand counts, because the greps permute: driven,
