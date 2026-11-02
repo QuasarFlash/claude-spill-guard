@@ -1983,10 +1983,8 @@ func TestAPrefixThatIsOnlyAssignmentShapedAfterExpansionIsNotPeeled(t *testing.T
 	// passing because every `$` defeats the resolver.
 	//
 	// What is NOT a control here is `V="cat f"; $V`, which reads the file in
-	// bash and is allowed silently both before and after this change: a
-	// substituted value is never word-split into a command plus operands.
-	// Pre-existing, a different mechanism from the peel order, and filed as
-	// Q188 rather than fixed here.
+	// bash through word splitting, a different mechanism from the peel order:
+	// TestASplitValueIsTheCommandItCarries holds it (Q188).
 	for _, tc := range []struct{ label, command string }{
 		{"written out -- control", "LC_ALL=C cat " + name},
 		{"an operand from a variable -- control", "d=. ; cat $d/" + name},
@@ -1998,6 +1996,110 @@ func TestAPrefixThatIsOnlyAssignmentShapedAfterExpansionIsNotPeeled(t *testing.T
 			}
 			if reason := reasonOf(t, stdout); !strings.Contains(reason, name) {
 				t.Errorf("reason = %q, want the file named -- bash reads it here", reason)
+			}
+		})
+	}
+}
+
+// An unquoted `$V` holding default-IFS whitespace is split into words before
+// bash runs it, so the first word is the command and the rest its operands
+// (Q188). The value used to be refused outright, since it was not one literal
+// path, which left `$V` the command name: no row, no operands, and the file
+// crossed with no verdict and no coverage record.
+//
+// Every row is driven on bash 5.3.15 as `env -i bash --norc --noprofile -c`,
+// over the same tree: the block rows print the key, and the allow rows read
+// nothing -- a quoted `"$V"` is one word, a word only partly the expansion is
+// a command name, and a split field that looks like an assignment is a
+// program bash cannot find, because what is an assignment was settled before
+// the expansion.
+func TestASplitValueIsTheCommandItCarries(t *testing.T) {
+	dir, name := planted(t)
+	if err := os.MkdirAll(filepath.Join(dir, "w"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	key, err := os.ReadFile(filepath.Join(dir, name))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "w", "x"), key, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, command := range []string{
+		`V="cat ` + name + `"; $V`,
+		`V="cat ` + name + `"; ${V}`,
+		`V="  cat   ` + name + `  "; $V`,
+		`V="` + name + ` nothere"; cat $V`,
+		`export V="cat ` + name + `"; $V`,
+		`V="cat *.env"; $V`,
+		// The prefix applies after the expansion, so the old V is read.
+		`V="cat ` + name + `"; V=y $V`,
+		// A builtin the split names runs like one written plainly.
+		`V="cd w"; $V; cat x`,
+		// A body is read by this walk, so these reach the split above.
+		`echo "$(V="cat ` + name + `"; $V)"`,
+		`echo "$(V="cd w"; $V; cat x)"`,
+		`V="cat ` + name + `"; echo "$($V)"`,
+		// The directory a body starts in comes from substStates, which
+		// splits on its own copy: the move has to be read there too.
+		`V="cd w"; $V; echo "$(cat x)"`,
+		`echo "$(V="cd w"; $V; echo "$(cat x)")"`,
+		// An empty or blank value is zero words, and bash drops the word.
+		`V=; $V cat ` + name,
+		`V=""; $V cat ` + name,
+		`V=" "; $V cat ` + name,
+		`V=''; ${V} cat ` + name,
+		`V=; $V $V cat ` + name,
+		`V=; cd $V w; cat x`,
+	} {
+		t.Run(command+" blocks", func(t *testing.T) {
+			code, stdout, stderr := drive(t, bashCall(t, command, dir))
+			if code != 0 {
+				t.Fatalf("exit code = %d, want 0 (stderr: %q)", code, stderr)
+			}
+			if stdout == "" {
+				t.Fatalf("allowed with no verdict, want a block (stderr: %q)", stderr)
+			}
+			if reason := reasonOf(t, stdout); !strings.Contains(reason, "aws-access-key-id") {
+				t.Errorf("reason does not name the rule: %q", reason)
+			}
+		})
+	}
+	for _, command := range []string{
+		`V="cat ` + name + `"; "$V"`,
+		`V="cat ` + name + `"; x$V`,
+		`V="LC_ALL=C cat ` + name + `"; $V`,
+		`(V="cat ` + name + `"); $V`,
+		`V="cat ` + name + `" true; $V`,
+		`echo "$(V="LC_ALL=C cat ` + name + `"; $V)"`,
+		// A quoted empty word is a command named '' and runs nothing.
+		`V=; "$V" cat ` + name,
+	} {
+		t.Run(command+" reads nothing", func(t *testing.T) {
+			code, stdout, stderr := drive(t, bashCall(t, command, dir))
+			if code != 0 {
+				t.Fatalf("exit code = %d, want 0 (stderr: %q)", code, stderr)
+			}
+			if stdout != "" {
+				t.Errorf("verdict = %q, want none -- bash opens no file here", stdout)
+			}
+		})
+	}
+	// A cd with a second operand is refused by bash and read by zsh as `cd old
+	// new`, so the operand after it has no directory to resolve in. The split
+	// routes `$V` there, and the literal spelling is the same reading.
+	for _, command := range []string{
+		`V="cd w x"; $V; cat ` + name,
+		`V="cd w"; $V x; cat ` + name,
+		`cd w x; cat ` + name,
+		`pushd w x; cat ` + name,
+		`cd w ''; cat ` + name,
+		`cd -L w x; cat ` + name,
+	} {
+		t.Run(command+" defers", func(t *testing.T) {
+			code, stdout, stderr := drive(t, bashCall(t, command, dir))
+			if reason := deferred(t, code, stdout, stderr); !strings.Contains(reason, "cannot follow") {
+				t.Errorf("coverage reason = %q, want it to say cannot follow", reason)
 			}
 		})
 	}

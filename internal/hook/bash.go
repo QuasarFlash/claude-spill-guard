@@ -183,6 +183,11 @@ func bashTargets(command, cwd string) ([]target, error) {
 				moved, dirUnknown = true, true
 			}
 			sub := v.expand(segment.Tokens)
+			// Split before observe folds this segment in, as bash expands
+			// before a prefix assignment applies: `V=y $V` reads the old V.
+			head := bash.ShKeywordPeel(segment.Tokens, segment.QuotedFrom)
+			head += bash.EnvPrefixPeel(segment.Tokens[head:], segment.QuotedFrom[head:])
+			argv := v.splitWords(segment.Tokens[head:], segment.QuotedFrom[head:], sub[head:])
 			inputs := v.expand(segment.Inputs)
 			v.noteCDPATH(segment.Tokens, sub, segment.QuotedFrom)
 			// The head is decided on the segment's own tokens and applied to
@@ -216,8 +221,7 @@ func bashTargets(command, cwd string) ([]target, error) {
 				list.ran()
 				continue
 			}
-			k := bash.ShKeywordPeel(segment.Tokens, segment.QuotedFrom)
-			tokens := sub[k+bash.EnvPrefixPeel(segment.Tokens[k:], segment.QuotedFrom[k:]):]
+			tokens := argv
 			if len(tokens) == 0 {
 				continue
 			}
@@ -640,6 +644,9 @@ func substStates(text string, subs []bash.Substitution, entry substState, lastpi
 			recordMarks(out, tok, here)
 		}
 		sub := v.expand(seg.Tokens)
+		head := bash.ShKeywordPeel(seg.Tokens, seg.QuotedFrom)
+		head += bash.EnvPrefixPeel(seg.Tokens[head:], seg.QuotedFrom[head:])
+		argv := v.splitWords(seg.Tokens[head:], seg.QuotedFrom[head:], sub[head:])
 		v.noteCDPATH(seg.Tokens, sub, seg.QuotedFrom)
 		if altersGlobbing(seg.Tokens, sub, seg.QuotedFrom) {
 			globsAltered = true
@@ -653,8 +660,7 @@ func substStates(text string, subs []bash.Substitution, entry substState, lastpi
 			list.ran()
 			continue
 		}
-		k := bash.ShKeywordPeel(seg.Tokens, seg.QuotedFrom)
-		tokens := sub[k+bash.EnvPrefixPeel(seg.Tokens[k:], seg.QuotedFrom[k:]):]
+		tokens := argv
 		if len(tokens) == 0 {
 			continue
 		}
@@ -940,7 +946,7 @@ func classifyCd(tokens []string) (kind, arg string) {
 	if name == "popd" {
 		return "unknown", "" // stack not tracked
 	}
-	for _, t := range tokens[1:] {
+	for i, t := range tokens[1:] {
 		if strings.HasPrefix(t, "-") {
 			if strings.Contains(t, "P") || (name == "pushd" && strings.Contains(t, "n")) {
 				return "unknown", ""
@@ -951,7 +957,9 @@ func classifyCd(tokens []string) (kind, arg string) {
 			return "subst", sub
 		}
 		t = expandTilde(t) // `cd ~/proj` tracks via home
-		if strings.HasPrefix(t, "+") || strings.HasPrefix(t, "~") || strings.ContainsAny(t, "$`") {
+		// bash refuses `cd w x` with "too many arguments" and stays put; zsh
+		// reads it as `cd old new` and moves somewhere else entirely.
+		if strings.HasPrefix(t, "+") || strings.HasPrefix(t, "~") || strings.ContainsAny(t, "$`") || i+2 < len(tokens) {
 			return "unknown", ""
 		}
 		return "arg", t
