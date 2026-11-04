@@ -1386,6 +1386,15 @@ defers. Until Q204 the first failure returned no buffers at all, so `echo <a
 key>; cat $X` and a key typed beside an `@` token with no working directory
 both exited 0 with no verdict.
 
+A buffer nothing decoded is the same case. Until Q244 a declared encoding this
+build cannot read deferred ahead of the findings, so `cat key.txt notes.utf32`,
+`echo <a key>; cat notes.utf32` and a prompt holding a key beside
+`@notes.utf32` all exited 0 with no verdict. They block now, and the notice names
+the unread buffer. They write no coverage record, as with Q204: the record exists
+because a deferred call is quiet to the person, and this one is not. A scan past
+its budget still discards what it found, which is Q227, and a `Grep` pattern
+beside a path that will not resolve is not read at all, which is Q245.
+
 **A payload that does not decode still blocks on exit 2.** Not JSON, no event,
 an event this binary cannot withhold at. That is the hook being invoked wrongly
 rather than a scanner failing to read something, and it is the signal that says
@@ -1457,8 +1466,9 @@ bytes can be in it. The skip is a decoder this build does not have rather than a
 trade it made — step 1 names the encoding because no measurement said the class
 was worth carrying. Recording costs close to nothing, because close to nothing
 is written in UTF-32, and the record names the file and the reason, so whoever
-sweeps the coverage log can convert it. The call itself proceeds and the
-override is not consulted, because there is no block left to downgrade.
+sweeps the coverage log can convert it. Where nothing else in the call matched,
+the call proceeds and the override is not consulted, because there is no block
+left to downgrade. A match beside it blocks and writes no record.
 
 **The binary skip is not recorded.** That one *is* the trade, and step 2 took it
 against a measurement — one PNG was 55% of the benchmark corpus. Denying every
