@@ -451,6 +451,8 @@ func failed(err error) string {
 	var part partlyDecoded
 	if errors.As(err, &part) {
 		switch part.label {
+		case filePathLabel:
+			opening = "The file_path was read as text and matched no rule, but the scan"
 		case commandLabel:
 			opening = "The command string was read and matched no rule, but the scan"
 		case promptLabel:
