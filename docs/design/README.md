@@ -3284,6 +3284,49 @@ having one: an arm assignment is where a wrong branch's path comes from.
 Upstream has neither the field nor the reading. It asks where a path lands, so
 an arm it never enters costs a prompt; this opens the file.
 
+### A word that runs code in this shell loses the directory
+
+`eval cd w; cat x` reads `w/x` on bash 5.3.15, and so do `source` and `.` of a
+file holding the `cd`, `trap 'cd w' DEBUG`, `mapfile -C 'cd w;:'`, and bash 5.3's
+two substitutions that run in the current shell, `${ cd w; }` and `${| cd w; }`.
+Until Q226 and Q228 the tracker read none of them as a move, so with the key in
+`w/x` each crossed with no verdict and no record. Q212 had covered them only
+where the words called a moving function.
+
+Each loses the directory now, so a relative operand after one is recorded, and a
+function whose body runs one moves the shell that calls it, as a body running
+`cd` already did. It is kept where the shape says nothing moves: an `eval` whose
+words past a leading `--` are all literal and whose re-parsed text holds no `cd`,
+no such word and no moving call, so `cd w; eval true; cat x` still reads `w/x`; a
+trap that resets, ignores, prints, or fires only on EXIT; and any of them in a
+pipeline stage. Upstream does none of
+this. Workspace-guard at `c1e1f81` lists `eval`, `source` and `.` as poisoning the
+variable map and keeps the directory, and it has no reading of a funsub.
+
+A funsub is a coverage failure in its own right, because `internal/bash` does not
+lex one. It splits `${ cd w; }` at the inner `;` and reads `${|` as a pipe, so the
+body's words join the command around it and no reader there is judged: on `main`,
+`echo ${ cat key.txt; }` exited 0 with no record while bash printed the key. It is
+recorded now, and reading the body is Q261. The opener is matched on a token, and
+a token arrives with its quoting removed, so a single-quoted `'${ x; }'`, an
+escaped `\${ x; }` and a zsh `${(…)}`, which the lexer splits at its `(`, are
+recorded too. The same removal is why no backslash before the `$` is read as an
+escape: `\\${ cd w; }` reaches the match as `\${`, and bash runs that body.
+
+Over the 240,454 distinct `Bash` commands in this machine's transcripts on
+2026-11-09, 4 changed: each gained a coverage record, and none changed verdict.
+One is `trap 'rm -f …' EXIT INT TERM`, which can fire before the end. The other
+three are the over-records just named, two single-quoted and one zsh. None was a
+real move. Two runs of `main` differed on one command, a glob over files that
+changed between the runs, which is the noise in that comparison.
+
+Reading no backslash as an escape costs more, and was measured on 2026-11-10 over
+246,901 distinct commands against the head that still read one: 16 gained a
+record, none changed verdict, and every one quotes the opener as text, in a grep
+pattern, a commit message or a heredoc editing these tests. 6 more differed only
+in the files they collected, and two further runs of the older head over those 22
+commands reproduced the 16 and none of the 6.
+
 ### A substitution body is resolved where it was written
 
 `cd sub && echo $(cat x)` reads `x` under `sub`, and it was a coverage record
