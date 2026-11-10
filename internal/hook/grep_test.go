@@ -325,6 +325,80 @@ func TestAFilterCountsWhereGrepsStdoutReachesIt(t *testing.T) {
 	}
 }
 
+// A stage between the grep and the filter that copies what it reads elsewhere
+// sends it around the filter (Q233). Driven on bash 5.3.15 with the built
+// filter and a planted key: every refused shape put the key in stdout or
+// stderr, and every allowed one put it in neither. The tee to out.log alone is
+// the stated control: allowed, because nothing in this string reads the file
+// and a later call that does is scanned then.
+func TestAStageThatCopiesAroundTheFilterDoesNotCount(t *testing.T) {
+	dir := grepTree(t)
+	refused := []string{
+		// A device judged where the name lands, not how it is spelled.
+		"grep -rn foo . | tee //dev/stderr | spill-guard filter",
+		"cd / && grep -rn foo " + dir + " | tee dev/stderr | spill-guard filter",
+		"grep -rn foo . | gtee /dev/stderr | spill-guard filter",
+		"grep -rn foo . | dd of=/dev/stderr status=none | spill-guard filter",
+		"grep -rn foo . | env -C / tee dev/stderr | spill-guard filter",
+		"grep -rn foo . | nice -n \"$N\" tee /dev/stderr | spill-guard filter",
+	}
+	// Under Git Bash /dev is not under the drive root, so neither of these
+	// reaches a device there.
+	if runtime.GOOS != "windows" {
+		if err := os.Symlink("/dev/stderr", filepath.Join(dir, "errlink")); err != nil {
+			t.Fatal(err)
+		}
+		refused = append(refused,
+			"grep -rn foo . | tee "+strings.Repeat("../", 40)+"dev/stderr | spill-guard filter",
+			"grep -rn foo . | tee errlink | spill-guard filter",
+		)
+	}
+	for _, command := range append(refused,
+		"grep -rn foo . | tee /dev/stderr | spill-guard filter",
+		"grep -rn foo . | tee /dev/fd/2 | spill-guard filter",
+		"grep -rn foo . | tee -a /dev/stderr | spill-guard filter",
+		"grep -rn foo . | tee /dev/tty | spill-guard filter",
+		"grep -rn foo . | tee >(cat >&2) | spill-guard filter",
+		"grep -rn foo . | tee \"$LOG\" | spill-guard filter",
+		"grep -rn foo . | cat >&2 | spill-guard filter",
+		"grep -rn foo . | head 1>&2 | spill-guard filter",
+		"grep -rn foo . | tee out.log | spill-guard filter; cat out.log",
+		"grep -rn foo . | tee out.log | spill-guard filter | cat out.log",
+		"grep -rn foo . | cat > out.log | spill-guard filter; cat out.log",
+		"grep -rn foo . 2>err.log | spill-guard filter && cat err.log",
+		"cat out.log & grep -rn foo . | tee out.log | spill-guard filter",
+	) {
+		t.Run(command+" is refused", func(t *testing.T) {
+			reason := denyReason(t, bashCall(t, command, dir))
+			if rewrite := rewriteIn(reason); rewrite != "" {
+				t.Errorf("the reason names a rewrite %q", rewrite)
+			}
+		})
+	}
+	for _, command := range []string{
+		"grep -rn foo . | tee out.log | spill-guard filter",
+		"set -o pipefail; grep -rn foo . | tee -a out.log | spill-guard filter",
+		"grep -rn foo . | tee /dev/null | spill-guard filter",
+		"grep -rn foo . | head -5 | spill-guard filter",
+		"grep -rn foo . | sort 2>/dev/null | spill-guard filter",
+		"grep -rn foo . | spill-guard filter | tee out.log",
+		"grep -rn foo . | tee //dev/null | spill-guard filter",
+		"grep -rn foo . | tee sub/out.log | spill-guard filter",
+		"grep -rn foo . | dd of=out.log status=none | spill-guard filter",
+		"grep -rn foo . | env -C sub tee out.log | spill-guard filter",
+	} {
+		t.Run(command+" is allowed", func(t *testing.T) {
+			allowed(t, bashCall(t, command, dir))
+		})
+	}
+	// The rewrite of a tee to a file is the control's shape, and is allowed.
+	rewrite := rewriteIn(denyReason(t, bashCall(t, "grep -rn foo . | tee out.log", dir)))
+	if rewrite == "" {
+		t.Fatal("no rewrite for a tee to a file")
+	}
+	allowed(t, bashCall(t, rewrite, dir))
+}
+
 // The hatch reaches this refusal like the others: a confirmation, not an allow.
 func TestTheOverrideDowngradesAGrepRefusal(t *testing.T) {
 	code, stdout, stderr := drive(t, bashCall(t,

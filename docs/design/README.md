@@ -2728,7 +2728,31 @@ where grep's stdout still reaches it. `grep -rn pat dir >&2 | spill-guard
 filter` sends the matches to stderr, which the tool result carries, so
 `Segment.StdoutAway` reads the redirects in order and the filter is not
 counted. A `{ …; }`, loop or subshell piped as a whole is one stage, so a grep
-inside one is filtered by the stage it feeds. Driven on bash 5.3.15 (Q208). The recursion flags
+inside one is filtered by the stage it feeds. Driven on bash 5.3.15 (Q208).
+
+**A stage between the grep and the filter can copy around it, and then the
+filter does not count.** Driven on bash 5.3.15 with the built filter and a
+planted key, `| tee /dev/stderr |`, `| tee >(cat >&2) |` and `| cat >&2 |` each
+put the key in the tool result while the filter withheld its own copy (Q233).
+So `copiedAround` refuses a stage that sends its stdout away, and one that
+writes to a device other than `/dev/null` or to a name it cannot settle. The
+names it reads are redirect targets, `tee` and `gtee` operands, and `dd`'s
+`of=`. A name is judged where it lands rather than how it is spelled: it is
+resolved against the directory the `cd` tracker holds and cleaned, so
+`//dev/stderr`, `../../dev/stderr` and `cd / && … | tee dev/stderr` count as
+the device, and a name that exists and is not a regular file is refused too,
+which takes in a symlink to `/dev/stderr`. An `env -C` or `sudo -D` ahead of
+the writer moves where its operands land, and a wrapper whose options this
+cannot read is refused, since the writer may be behind it. Each of those put
+the key on stderr before this, driven in review of #254. A
+copy to a regular file is allowed when nothing else in the string can read it.
+`grep -rn pat dir | tee out.log | spill-guard filter` is allowed, because a
+later call that reads `out.log` is scanned when it runs. Adding `; cat out.log`
+gets it refused, because the hook resolves that operand before the file is
+written. The program of an awk or sed stage is not read, and neither is any
+other command that takes an output path: Q257.
+
+The recursion flags
 are parsed in `internal/hook/grep.go` — `-r`, `-R`, `--recursive`,
 `--dereference-recursive`, `-d recurse`, and a digit option such as `-2` —
 and a flag after an operand counts, because the greps permute: driven,
