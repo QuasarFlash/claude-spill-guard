@@ -93,12 +93,29 @@ a re-vendor is an overwrite rather than a merge. Send the change upstream,
 then re-vendor and move the row above to the new commit — which puts the
 digest change in the same diff, where a reviewer sees it.
 
-Re-vendoring is a copy and a digest:
+Re-vendoring reads the file out of a revision, never off a checkout's disk. A
+checkout can be behind its origin, ahead of it, on another branch or dirty, and
+a `cp` out of one writes bytes under a row that may name a different commit:
+nothing compares the two, and `make vendor` only checks the bytes against the
+digest written beside them. Fetch, then read `origin/main`, once per file:
 
 ```bash
-cp <skills-checkout>/session-backlog/scripts/queue.py scripts/vendor/claude-skills/queue.py
+git -C <skills-checkout> fetch origin
+git -C <skills-checkout> show origin/main:session-backlog/scripts/queue.py \
+    > scripts/vendor/claude-skills/queue.py
+git -C <skills-checkout> log -1 --format='%h, %cs' origin/main -- \
+    session-backlog/scripts/queue.py
 shasum -a 256 scripts/vendor/claude-skills/queue.py
 ```
+
+The `log` line prints the value for the "Taken from" column, from the same
+revision the bytes came from, so neither half is typed by hand. It names the
+last commit that touched that file, which is why `queue.py` and
+`alloc-queue-id.sh` can carry different commits. The two rows above were
+written before this block existed and name the upstream tip each file was read
+at (`f1fae51`, which touched neither), so the column changes meaning at the next
+re-vendor. The `>` truncates the existing
+file rather than recreating it, so the `100755` mode in the index survives.
 
 ### The table above is what `make vendor` reads
 
