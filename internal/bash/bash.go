@@ -725,7 +725,7 @@ func segments(cmd string, stripHeredocs bool) ([]Segment, error) {
 		cur = append(cur, t)
 		curQF = append(curQF, quotedFrom[i])
 		opening := len(clauses) > 0 && clauses[len(clauses)-1] == "in"
-		trackCase(&clauses, t, cmdPos)
+		trackCase(&clauses, t, quotedFrom[i], cmdPos)
 		// The `in` that opens the first pattern is no word of it.
 		patStarted = !opening || clauses[len(clauses)-1] != "pat"
 		i++
@@ -797,12 +797,17 @@ func continuesTime(cur []string, curQF []int, word string, wordQF int) bool {
 
 // trackCase advances the `case` clause states for one word token. The three
 // arms and their order are scanDollarParen's: a clause waiting for its `in`
-// sees nothing else, an `esac` closes the innermost clause that has one, and
+// sees nothing else, an `esac` closes the innermost clause that has one --
+// from an arm's body only in command position, so the `esac` in `echo esac`
+// is an operand there as it is to bash (Q259) -- and
 // `case` opens one only in command position, which is the compound tracker's
 // rather than cmdPosKeywords' -- `{ case`, `! case` and `} then case` are
-// all the keyword (Q217). An unterminated `case` leaves its clause open, so
-// every segment after the pattern stays marked -- the fail-closed direction.
-func trackCase(clauses *[]string, word string, cmdPos bool) {
+// all the keyword (Q217). Neither is a keyword quoted, so `'esac'`, `e\sac`
+// and `"esac"` close nothing, in an arm or as a pattern. An unterminated
+// `case` leaves its clause open, so every segment after the pattern stays
+// marked -- the fail-closed direction.
+func trackCase(clauses *[]string, word string, quotedFrom int, cmdPos bool) {
+	keyword := quotedFrom == NotQuoted
 	n := len(*clauses)
 	state := ""
 	if n > 0 {
@@ -813,9 +818,9 @@ func trackCase(clauses *[]string, word string, cmdPos bool) {
 		if word == "in" {
 			(*clauses)[n-1] = "pat"
 		}
-	case n > 0 && word == "esac":
+	case keyword && n > 0 && word == "esac" && (cmdPos || state != "body"):
 		*clauses = (*clauses)[:n-1]
-	case word == "case" && cmdPos:
+	case keyword && word == "case" && cmdPos:
 		*clauses = append(*clauses, "in")
 	}
 }
