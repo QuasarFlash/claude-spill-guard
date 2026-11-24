@@ -1,0 +1,20 @@
+# One sentence per source line in every Markdown file here. A one-sentence edit
+# is then a one-line diff, and two branches editing one paragraph stop
+# colliding on the rewrap.
+#
+# max-width stays 0. A width turns on clause-level splitting, which is where
+# mdreflow's known render changes live; unbounded sentence mode breaks only at
+# the end of a sentence.
+mode: sentence
+max-width: 0
+
+exclude:
+  # GitHub renders a release body as a comment, where a newline is a <br>, and
+  # the release-notes gate holds each file to its published body.
+  - "/docs/releases/v*.md"
+  # The precision corpus, read for match counts and byte offsets. A directory
+  # takes `/**`: a trailing slash alone does not match a file named on the
+  # command line, which is how scripts/check-md-reflow.py names them. And
+  # `/*/**` matches the page beside the directories too, so it is let back in.
+  - "/testdata/corpus/**"
+  - "!/testdata/corpus/README.md"
